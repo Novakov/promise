@@ -113,3 +113,82 @@ def test_dataloader_thread_safety():
 
     assert assert_object['is_same_thread_1']
     assert assert_object['is_same_thread_2']
+
+
+import pytest
+
+@pytest.mark.parametrize('num_threads', [1])
+@pytest.mark.parametrize('count', [10_000])
+def test_with_process_loop(num_threads, count):
+    from queue import Queue
+    from threading import Thread, Barrier
+    from sys import setswitchinterval
+    from traceback import print_exc, format_exc
+
+    items = Queue()
+
+    barrier = Barrier(num_threads)
+
+    force_stop = False
+    asserts = []
+    timeouts = []
+
+    def event_loop():
+        stop_count = num_threads
+        while True:
+            item = items.get()
+            if item[0] == 'STOP':
+                stop_count -= 1
+                if stop_count == 0:
+                    break
+            if item[0] == 'ABORT':
+                break
+            if item[0] == 'ITEM':
+                (_, resolve, i) = item
+                resolve(i)
+
+    def worker():
+        nonlocal force_stop
+        barrier.wait()
+        # Force fast switching of threads, this is NOT used in real world case. However without this
+        # I was unable to reproduce the issue. 
+        setswitchinterval(0.001)
+        for i in range(0, count):
+            if force_stop:
+                break
+
+            def do(resolve, reject):
+                items.put(('ITEM', resolve, i))
+
+            p = Promise(do)
+            try:
+                p.get(timeout=1)
+            except AssertionError as e:
+                print("ASSERT", e)
+                print_exc()
+                force_stop = True
+                items.put(('ABORT', ))
+                asserts.append(format_exc())
+            except Exception as e:
+                print("Timeout", e)
+                print_exc()
+                force_stop = True
+                items.put(('ABORT',))
+                timeouts.append(format_exc())
+
+        items.put(('STOP', ))
+
+    loop_thread = Thread(target=event_loop)
+    loop_thread.start()
+
+    worker_threads = [Thread(target=worker) for i in range(0, num_threads)]
+    for t in worker_threads:
+        t.start()
+
+    loop_thread.join()
+    for t in worker_threads:
+        t.join()
+
+    assert asserts == []
+    assert timeouts == []
+
